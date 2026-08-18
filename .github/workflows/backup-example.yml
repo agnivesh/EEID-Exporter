@@ -1,0 +1,69 @@
+# Example workflow: back up a Microsoft Entra External ID tenant on a schedule,
+# authenticating with workload identity federation (no stored client secret).
+#
+# One-time setup before this workflow will work:
+#   1. Register an app in the CIAM tenant (or reuse an existing one) and grant it the
+#      delegated/application Graph scopes documented in README.md.
+#   2. Add a federated credential on that app registration:
+#        Issuer:  https://token.actions.githubusercontent.com
+#        Subject: repo:<org>/<repo>:environment:backup   (adjust to your repo/environment)
+#        Audience: api://AzureADTokenExchange
+#   3. Set repository/environment variables AZURE_CLIENT_ID and AZURE_TENANT_ID
+#      (the CIAM tenant's ID) -- no secret needed.
+name: Backup Entra External ID tenant (example)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 3 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  backup:
+    name: Export and publish backup
+    runs-on: ubuntu-latest
+    environment: backup
+    permissions:
+      id-token: write # mints the OIDC token azure/login exchanges for a Graph access token via the app registration's federated credential -- no client secret stored in this repo
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Federated sign-in to Azure (mints the OIDC token used below)
+        uses: azure/login@f5d393ae46f8fde4be8b75f32e3fc50e654ad0ca # v3.0.1
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Export the tenant configuration
+        shell: pwsh
+        run: |
+          Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force
+          Import-Module ./src/EntraExternalIDExporter.psd1
+
+          Connect-MgGraph -EnvironmentVariable -NoWelcome
+
+          Export-EEID -Path ./backup -All
+        env:
+          AZURE_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+
+      - name: Publish backup as a build artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: eeid-backup-${{ github.run_id }}
+          path: backup/
+          retention-days: 30
+
+      # To publish to Azure Blob Storage or S3 instead of/in addition to the artifact
+      # above, add a step that runs Publish-EEIDBackup -Path ./backup ... -- see
+      # README.md "Publishing backups to cloud storage".

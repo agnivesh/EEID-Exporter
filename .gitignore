@@ -1,0 +1,8 @@
+bin/
+obj/
+*.log
+.vscode/
+out/
+backup/
+*.Tests.ps1.orig
+testResults*.xml

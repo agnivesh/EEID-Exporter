@@ -1,0 +1,60 @@
+# Example pipeline: back up a Microsoft Entra External ID tenant, authenticating via
+# an Azure DevOps workload identity federation service connection (no stored secret).
+#
+# One-time setup before this pipeline will work:
+#   1. Register an app in the CIAM tenant (or reuse an existing one) and grant it the
+#      delegated/application Graph scopes documented in README.md.
+#   2. Project Settings > Service connections > New service connection > Azure
+#      Resource Manager > Workload identity federation (automatic or manual), pointed
+#      at that app registration. Name it "eeid-backup-connection" or update the
+#      azureSubscription value below to match whatever name you choose.
+#   3. Grant the pipeline access to that service connection when prompted on first run.
+
+trigger: none
+
+schedules:
+  - cron: '0 3 * * *'
+    displayName: Nightly backup
+    branches:
+      include:
+        - main
+    always: true
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  azureSubscription: 'eeid-backup-connection'
+  tenantId: '$(EEID_TENANT_ID)' # set as a pipeline variable, not a secret -- it's not sensitive
+
+steps:
+  - task: AzureCLI@2
+    displayName: 'Mint a Graph-scoped access token via workload identity federation'
+    inputs:
+      azureSubscription: $(azureSubscription)
+      scriptType: bash
+      scriptLocation: inlineScript
+      inlineScript: |
+        TOKEN=$(az account get-access-token --resource https://graph.microsoft.com --query accessToken -o tsv)
+        echo "##vso[task.setvariable variable=GraphAccessToken;issecret=true]$TOKEN"
+
+  - task: PowerShell@2
+    displayName: 'Export the tenant configuration'
+    inputs:
+      targetType: inline
+      pwsh: true
+      script: |
+        Install-Module Microsoft.Graph.Authentication -Scope CurrentUser -Force
+        Import-Module ./src/EntraExternalIDExporter.psd1
+
+        $secureToken = ConvertTo-SecureString -String "$(GraphAccessToken)" -AsPlainText -Force
+        Connect-MgGraph -AccessToken $secureToken -NoWelcome
+
+        Export-EEID -Path $(Build.ArtifactStagingDirectory)/backup -All
+
+  - publish: $(Build.ArtifactStagingDirectory)/backup
+    artifact: eeid-backup
+
+  # To publish to Azure Blob Storage or S3 instead of/in addition to the pipeline
+  # artifact above, add a PowerShell@2 step that runs Publish-EEIDBackup -Path ... --
+  # see README.md "Publishing backups to cloud storage".
