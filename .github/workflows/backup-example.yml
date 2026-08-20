@@ -12,10 +12,10 @@
 #      (the CIAM tenant's ID) -- no secret needed.
 name: Backup Entra External ID tenant (example)
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 3 * * *'
+#on:
+#  workflow_dispatch:
+#  schedule:
+#    - cron: '0 3 * * *'
 
 concurrency:
   group: ${{ github.workflow }}
