@@ -11,10 +11,8 @@
         # to disk.
         'PSAvoidUsingWriteHost',
 
-        # Get-EEIDRequiredScopes and Get-MgGraphAllPages both return a collection by
-        # design; the plural noun accurately describes that. Get-MgGraphAllPages in
-        # particular is a well-known community helper pattern kept under its
-        # original name on purpose.
+        # Get-EEIDRequiredScopes returns a collection by design; the plural noun
+        # accurately describes that.
         'PSUseSingularNouns',
 
         # New-GraphBatchRequest and New-FinalUri are pure functions -- they build and
