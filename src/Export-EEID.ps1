@@ -90,20 +90,6 @@ function Export-EEID {
         $schemaScopeType = "ApplicationPermission"
     }
 
-    # modify schema filter property if needed
-    foreach ($entry in $ExportSchema) {
-        $graphUri = Get-ObjectProperty $entry "GraphUri"
-        # filter out synced users or groups
-        if ($CloudUsersAndGroupsOnly -and ($graphUri -in "users", "groups")) {
-            if ([string]::IsNullOrEmpty($entry.Filter)) {
-                $entry.Filter = "onPremisesSyncEnabled ne true"
-            }
-            else {
-                $entry.Filter = $entry.Filter + " and (onPremisesSyncEnabled ne true)"
-            }
-        }
-    }
-
     #region helper functions
     function _randomizeRequestId {
         <#
@@ -139,38 +125,81 @@ function Export-EEID {
         $requestId -replace "\%\%\%\d+\%\%\%", ""
     }
 
+    function _getEntryUri {
+        <#
+        Builds the relative request URI for a schema entry, adding the cloud-only filter
+        to users and groups requests when requested. The schema itself is never modified.
+        #>
+
+        param(
+            [Parameter(Mandatory = $true)]
+            [object]$schemaEntry
+        )
+
+        $filter = Get-ObjectProperty $schemaEntry 'Filter'
+
+        if ($CloudUsersAndGroupsOnly -and ((Get-ObjectProperty $schemaEntry 'GraphUri') -in 'users', 'groups')) {
+            $syncFilter = 'onPremisesSyncEnabled ne true'
+            $filter = if ([string]::IsNullOrEmpty($filter)) { $syncFilter } else { "$filter and ($syncFilter)" }
+        }
+
+        New-FinalUri -RelativeUri (Get-ObjectProperty $schemaEntry 'GraphUri') -Select (Get-ObjectProperty $schemaEntry 'Select') -QueryParameters (Get-ObjectProperty $schemaEntry 'QueryParameters') -Filter $filter
+    }
+
+    function _getEntryApiVersion {
+        param(
+            [Parameter(Mandatory = $true)]
+            [object]$schemaEntry
+        )
+
+        $apiVersion = Get-ObjectProperty $schemaEntry 'ApiVersion'
+        if ($apiVersion) { $apiVersion } else { 'v1.0' }
+    }
+
+    function _queueRequest {
+        param(
+            [Parameter(Mandatory = $true)]
+            [object]$request,
+
+            [Parameter(Mandatory = $true)]
+            [string]$apiVersion
+        )
+
+        if ($apiVersion -eq 'beta') {
+            $batchRequestBetaApi.Add($request)
+        } else {
+            $batchRequestStableApi.Add($request)
+        }
+    }
+
     function _processBatchErrors {
         param(
             [array]$requestErrors,
             [array]$requestedExportSchema
         )
 
+        $ignorePatterns = @(Get-EEIDFlattenedSchema -ExportSchema $requestedExportSchema |
+                ForEach-Object { $_.IgnoreError } | Select-Object -Unique)
+
         foreach ($err in $requestErrors) {
-            if ($err.Exception.Source -eq "BatchRequest") {
-                # batch request errors
-
-                # it happens that before starting to retrieve details, the object is deleted
-                # in this case we get 404 error which we can safely ignore
-                if ($err.TargetObject.response.status -in 400, 404) {
-                    Write-Verbose "Ignoring request with id '$($err.TargetObject.request.id)' as it returned status code $($err.TargetObject.response.status)"
-                    continue
-                }
-
-                # ignore errors specified in the schema
-                $requestedExportSchema.IgnoreError | select -Unique | % {
-                    if ($err.Exception.Message -like "*$_*") {
-                        Write-Verbose "Ignoring request with id '$($err.TargetObject.request.id)' as it returned error to ignore '$_'"
-                        continue
-                    }
-                }
-
+            if ($err.Exception.Source -ne "BatchRequest") {
                 Write-Error $err
-                break
-            } else {
-                # other non-batch-related errors
-                Write-Error $err
-                break
+                continue
             }
+
+            # the object may be deleted between listing and retrieving its details
+            if ($err.TargetObject.response.status -eq 404) {
+                Write-Verbose "Ignoring request with id '$($err.TargetObject.request.id)' as it returned status code 404"
+                continue
+            }
+
+            $matchedPattern = $ignorePatterns | Where-Object { $err.Exception.Message -like "*$_*" } | Select-Object -First 1
+            if ($matchedPattern) {
+                Write-Verbose "Ignoring request with id '$($err.TargetObject.request.id)' as it returned error to ignore '$matchedPattern'"
+                continue
+            }
+
+            Write-Error $err
         }
     }
 
@@ -178,10 +207,7 @@ function Export-EEID {
         param(
             [array]$schemaItems,
             [string]$basePath,
-            [array]$parentIds,
-            [ref]$results,
-            [ref]$batchRequestStableApi,
-            [ref]$batchRequestBetaApi
+            [array]$parentIds
         )
 
         foreach ($item in $schemaItems) {
@@ -192,12 +218,9 @@ function Export-EEID {
                 continue
             }
 
-            $graphUri = Get-ObjectProperty $item 'GraphUri'
-            $apiVersion = Get-ObjectProperty $item 'ApiVersion'
             $children = Get-ObjectProperty $item 'Children'
-            if (!$apiVersion) { $apiVersion = 'v1.0' }
-
-            $uri = New-FinalUri -RelativeUri $graphUri -Select (Get-ObjectProperty $item 'Select') -QueryParameters (Get-ObjectProperty $item 'QueryParameters') -Filter (Get-ObjectProperty $item 'Filter')
+            $apiVersion = _getEntryApiVersion $item
+            $uri = _getEntryUri $item
 
             $parentIds | % {
                 if ($item.Path -match "\.json$") {
@@ -216,12 +239,7 @@ function Export-EEID {
 
                 $request = New-GraphBatchRequest -Url $uri -Id $id -placeholder $_ -header @{ ConsistencyLevel = 'eventual' }
 
-                if ($apiVersion -eq 'beta') {
-                    $batchRequestBetaApi.Value.Add($request)
-                }
-                else {
-                    $batchRequestStableApi.Value.Add($request)
-                }
+                _queueRequest -request $request -apiVersion $apiVersion
             }
 
             # recursively process children if they exist
@@ -297,12 +315,9 @@ function Export-EEID {
             continue
         }
 
-        $graphUri = Get-ObjectProperty $item 'GraphUri'
-        $apiVersion = Get-ObjectProperty $item 'ApiVersion'
         $children = Get-ObjectProperty $item 'Children'
-        if (!$apiVersion) { $apiVersion = 'v1.0' }
-
-        $uri = New-FinalUri -RelativeUri $graphUri -Select (Get-ObjectProperty $item 'Select') -QueryParameters (Get-ObjectProperty $item 'QueryParameters') -Filter (Get-ObjectProperty $item 'Filter')
+        $apiVersion = _getEntryApiVersion $item
+        $uri = _getEntryUri $item
 
         # batch request id cannot contain '\' character
         $id = $outputFileName -replace '\\', '/'
@@ -314,12 +329,7 @@ function Export-EEID {
 
         $request = New-GraphBatchRequest -Url $uri -Id $id -header @{ ConsistencyLevel = 'eventual' }
 
-        if ($apiVersion -eq 'beta') {
-            $batchRequestBetaApi.Add($request)
-        }
-        else {
-            $batchRequestStableApi.Add($request)
-        }
+        _queueRequest -request $request -apiVersion $apiVersion
 
         # track children for later processing
         if ($children) {
@@ -357,7 +367,7 @@ function Export-EEID {
             $parentIds = $parentResult.Id | select -Unique
             Write-Verbose "Processing children results for parent '$($childGroup.ParentPath)' ($($parentIds.count))"
 
-            _processChildrenRecursive -schemaItems $childGroup.Children -basePath $childGroup.BasePath -parentIds $parentIds -results ([ref]$results) -batchRequestStableApi ([ref]$batchRequestStableApi) -batchRequestBetaApi ([ref]$batchRequestBetaApi)
+            _processChildrenRecursive -schemaItems $childGroup.Children -basePath $childGroup.BasePath -parentIds $parentIds
         }
 
         # execute batch requests for this level
@@ -376,6 +386,11 @@ function Export-EEID {
             Write-Verbose "Result without 'id' property, using '$itemId' instead (RequestId '$($item.RequestId)')!"
         } else {
             $itemId = $item.id
+        }
+
+        if ("$itemId" -match '[\\/]|^\.\.?$') {
+            Write-Error "Skipping '$itemId' (request '$($item.RequestId)'): the id contains a path separator or is a relative path segment."
+            continue
         }
 
         if (!$item.RequestId) {

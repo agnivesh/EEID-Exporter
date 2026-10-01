@@ -42,6 +42,11 @@ function Invoke-GraphBatchRequest {
     .PARAMETER separateErrors
     Switch to return batch request errors one by one instead of all at once.
 
+    .PARAMETER retryAttempt
+    For internal use. Number of times the given requests were already retried after being
+    throttled or failing with a server-side error. Requests still failing after 5 retries
+    are reported as errors.
+
     .EXAMPLE
     [System.Collections.Generic.List[object]] $batchRequest = @()
 
@@ -82,7 +87,9 @@ function Invoke-GraphBatchRequest {
 
         [switch] $dontFollowNextLink,
 
-        [switch] $separateErrors
+        [switch] $separateErrors,
+
+        [int] $retryAttempt = 0
     )
 
     begin {
@@ -104,8 +111,49 @@ function Invoke-GraphBatchRequest {
         $requestChunk = [System.Collections.Generic.List[Object]]::new()
         # paginated or remotely failed requests that should be processed too, to get all the results
         $extraRequestChunk = [System.Collections.Generic.List[Object]]::new()
-        # throttled requests that have to be repeated after given time
-        $throttledRequestChunk = [System.Collections.Generic.List[Object]]::new()
+        # throttled or server-side failed requests that have to be repeated after a wait
+        $retryRequestChunk = [System.Collections.Generic.List[Object]]::new()
+        $maxRetries = 5
+        $maxBackoffSeconds = 30
+        # seconds to wait before the retry request chunk is repeated (per invocation, not shared with recursive calls)
+        $state = @{ RetryWait = 0 }
+
+        function _processFollowUps {
+            <#
+                .SYNOPSIS
+                Runs requests that have to be repeated: paginated ones (next page) and retried ones
+                (throttled or failed on remote server) after the longest required wait.
+            #>
+
+            param (
+                [Parameter(Mandatory = $true)]
+                [hashtable] $Parameters
+            )
+
+            if ($extraRequestChunk) {
+                Write-Verbose "Processing $($extraRequestChunk.count) paginated request(s)"
+
+                $nextPageParameters = $Parameters.Clone()
+                $nextPageParameters['batchRequest'] = $extraRequestChunk
+                $nextPageParameters['retryAttempt'] = 0
+                Invoke-GraphBatchRequest @nextPageParameters
+
+                $extraRequestChunk.Clear()
+            }
+
+            if ($retryRequestChunk) {
+                Write-Verbose "Processing $($retryRequestChunk.count) request(s) to retry (attempt $($retryAttempt + 1)) with $($state.RetryWait) seconds wait time"
+
+                if ($state.RetryWait -gt 0) { Start-Sleep -Seconds $state.RetryWait }
+
+                $retryParameters = $Parameters.Clone()
+                $retryParameters['batchRequest'] = $retryRequestChunk
+                $retryParameters['retryAttempt'] = $retryAttempt + 1
+                Invoke-GraphBatchRequest @retryParameters
+
+                $retryRequestChunk.Clear()
+            }
+        }
 
         function _processChunk {
             <#
@@ -260,37 +308,35 @@ function Invoke-GraphBatchRequest {
                             # add the request for later processing
                             $extraRequestChunk.Add($nextLinkRequest)
                         }
-                    } elseif ($response.Status -in 429, 509) {
-                        # throttled (will be repeated after given time)
+                    } elseif ($response.Status -in 429, 509, 500, 502, 503, 504) {
+                        # throttled or internal error on remote side (will be repeated after a wait)
 
-                        $jobRetryAfter = $response.Headers.'Retry-After'
-                        $throttledBatchRequest = $requestChunk | ? Id -EQ $response.Id
+                        $retryBatchRequest = $requestChunk | ? Id -EQ $response.Id
 
-                        Write-Verbose "Batch request with Id: '$($throttledBatchRequest.Id)', Url:'$($throttledBatchRequest.Url)' was throttled, hence will be repeated after $jobRetryAfter seconds"
-
-                        if ($jobRetryAfter -eq 0) {
-                            # request can be repeated without any delay
-                            #TIP for performance reasons adding to $extraRequestChunk batch (to avoid invocation of unnecessary batch job)
-                            $extraRequestChunk.Add($throttledBatchRequest)
-                        } else {
-                            # request can be repeated after delay
-                            # add the request for later processing
-                            $throttledRequestChunk.Add($throttledBatchRequest)
+                        if ($retryAttempt -ge $maxRetries) {
+                            $failedBatchJob.Add(
+                                @{
+                                    Id         = $response.Id
+                                    Url        = $retryBatchRequest.Url
+                                    StatusCode = $response.Status
+                                    Error      = "Giving up after $maxRetries retries. $($response.body.error.message)"
+                                    Object     = [ordered]@{
+                                        request  = $retryBatchRequest
+                                        response = $response
+                                    }
+                                }
+                            )
+                            continue
                         }
 
-                        # get highest retry-after wait time
-                        if ($jobRetryAfter -gt $script:retryAfter) {
-                            Write-Verbose "Setting $jobRetryAfter retry-after time"
-                            $script:retryAfter = $jobRetryAfter
-                        }
-                    } elseif ($response.Status -in 500, 502, 503, 504) {
-                        # some internal error on remote side (will be repeated)
+                        $backoff = [Math]::Min([Math]::Pow(2, $retryAttempt), $maxBackoffSeconds)
+                        $wait = if ($response.Status -in 429, 509) { [int]$response.Headers.'Retry-After' } else { $backoff }
 
-                        $problematicBatchRequest = $requestChunk | ? Id -EQ $response.Id
+                        Write-Verbose "Batch request with Id: '$($retryBatchRequest.Id)', Url:'$($retryBatchRequest.Url)' failed with status $($response.Status) '$($response.body.error.message)', hence will be repeated after $wait seconds"
 
-                        Write-Verbose "Batch request with Id: '$($problematicBatchRequest.Id)', Url:'$($problematicBatchRequest.Url)' had internal error '$($response.body.error.message)', Code: $($response.Status), hence will be repeated"
+                        $retryRequestChunk.Add($retryBatchRequest)
 
-                        $extraRequestChunk.Add($problematicBatchRequest)
+                        if ($wait -gt $state.RetryWait) { $state.RetryWait = $wait }
                     } else {
                         # failed
 
@@ -372,11 +418,10 @@ function Invoke-GraphBatchRequest {
 
     process {
         # check url validity
-        $batchRequest.URL | % {
-            if ($_ -like "http*" -or $_ -like "*/beta/*" -or $_ -like "*/v1.0/*" -or $_ -like "*/graph.microsoft.com/*") {
-                Write-Warning "url '$_' has to be relative (without the whole 'https://graph.microsoft.com/<apiversion>' part)!"
-                return
-            }
+        $absoluteUrl = $batchRequest.URL | Where-Object { $_ -like "http*" -or $_ -like "*/beta/*" -or $_ -like "*/v1.0/*" -or $_ -like "*/graph.microsoft.com/*" } | Select-Object -First 1
+        if ($absoluteUrl) {
+            Write-Error "url '$absoluteUrl' has to be relative (without the whole 'https://graph.microsoft.com/<apiversion>' part)!"
+            return
         }
 
         foreach ($request in $batchRequest) {
@@ -384,33 +429,13 @@ function Invoke-GraphBatchRequest {
 
             # check if the buffer has reached the required chunk size
             if ($requestChunk.count -eq $chunkSize) {
-                [int] $script:retryAfter = 0
+                $state.RetryWait = 0
                 _processChunk $requestChunk
 
                 # clear the buffer
                 $requestChunk.Clear()
 
-                # process requests that need to be repeated (paginated, failed on remote server,...)
-                if ($extraRequestChunk) {
-                    Write-Verbose "Processing $($extraRequestChunk.count) paginated or server-side-failed request(s)"
-
-                    $PSBoundParameters['batchRequest'] = $extraRequestChunk
-                    Invoke-GraphBatchRequest @PSBoundParameters
-
-                    $extraRequestChunk.Clear()
-                }
-
-                # process throttled requests
-                if ($throttledRequestChunk) {
-                    Write-Verbose "Processing $($throttledRequestChunk.count) throttled request(s) with $script:retryAfter seconds wait time"
-
-                    Start-Sleep -Seconds $script:retryAfter
-
-                    $PSBoundParameters['batchRequest'] = $throttledRequestChunk
-                    Invoke-GraphBatchRequest @PSBoundParameters
-
-                    $throttledRequestChunk.Clear()
-                }
+                _processFollowUps -Parameters $PSBoundParameters
             }
         }
     }
@@ -419,25 +444,10 @@ function Invoke-GraphBatchRequest {
         # process any remaining requests in the buffer
 
         if ($requestChunk.Count -gt 0) {
-            [int] $script:retryAfter = 0
+            $state.RetryWait = 0
             _processChunk $requestChunk
 
-            # process requests that need to be repeated (paginated, failed on remote server,...)
-            if ($extraRequestChunk) {
-                Write-Verbose "Processing $($extraRequestChunk.count) paginated or server-side-failed request(s)"
-                $PSBoundParameters['batchRequest'] = $extraRequestChunk
-                Invoke-GraphBatchRequest @PSBoundParameters
-            }
-
-            # process throttled requests
-            if ($throttledRequestChunk) {
-                Write-Verbose "Processing $($throttledRequestChunk.count) throttled request(s) with $script:retryAfter seconds wait time"
-
-                Start-Sleep -Seconds $script:retryAfter
-
-                $PSBoundParameters['batchRequest'] = $throttledRequestChunk
-                Invoke-GraphBatchRequest @PSBoundParameters
-            }
+            _processFollowUps -Parameters $PSBoundParameters
         }
     }
 }
